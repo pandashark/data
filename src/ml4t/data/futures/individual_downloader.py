@@ -23,7 +23,6 @@ Usage:
             "CL": {"months": list(range(1, 13))},  # Monthly
         },
         years=[2024, 2025],
-        storage_path="~/ml4t-data/futures/individual",
     )
     downloader = IndividualDownloader(config)
     downloader.download_all()

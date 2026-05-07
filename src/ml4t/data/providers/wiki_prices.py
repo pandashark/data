@@ -551,13 +551,12 @@ class WikiPricesProvider(BaseProvider):
         Args:
             output_path: Directory or file path for the downloaded data.
                         If directory, saves as 'wiki_prices.parquet' in that directory.
-                        Defaults to ~/ml4t/data/wiki/wiki_prices.parquet
+                        Defaults to <data-root>/wiki/wiki_prices.parquet
             api_key: NASDAQ Data Link API key. If not provided, looks for:
                     1. QUANDL_API_KEY environment variable
                     2. NASDAQ_DATA_LINK_API_KEY environment variable
                     3. API key in env_file
-            env_file: Path to .env file containing API key (default: ~/.env or
-                     ~/ml4t/software/data/.env)
+            env_file: Path to .env file containing API key (default: ~/.env or .env)
 
         Returns:
             Path to the downloaded Parquet file

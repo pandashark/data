@@ -63,7 +63,7 @@ class ContinuousContractBuilder:
                 - "quandl_chris": Quandl CHRIS data (legacy)
                 - "databento": Databento downloaded data
             storage_path: For databento, path where data was downloaded.
-                         Defaults to ~/ml4t-data/futures
+                         Defaults to <data-root>/futures
 
         Returns:
             DataFrame with columns:

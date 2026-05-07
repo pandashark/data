@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from ml4t.data.config.models import DataConfig, StorageConfig
 from ml4t.data.core.config import Config, resolve_data_root, resolve_storage_path
 from ml4t.data.cot.fetcher import COTConfig
@@ -76,3 +78,30 @@ def test_provider_default_paths_follow_ml4t_data_path(monkeypatch, tmp_path: Pat
     assert ITCHSampleProvider.default_parsed_path() == (
         root.resolve() / "equities" / "nasdaq_itch" / "messages"
     )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "allowed_files"),
+    [
+        ("~/ml4t/data", set()),
+        ("~/ml4t-data", set()),
+        ("~/.ml4t/data", set()),
+        ("~/.qldm/data", set()),
+        ('Path.home() / "ml4t-data"', set()),
+        ('Path.home() / "ml4t" / "data"', set()),
+    ],
+)
+def test_source_contains_no_hardcoded_home_storage_paths(
+    pattern: str,
+    allowed_files: set[str],
+) -> None:
+    src_root = Path(__file__).resolve().parents[1] / "src" / "ml4t" / "data"
+    offenders: list[str] = []
+
+    for path in src_root.rglob("*.py"):
+        if path.name in allowed_files:
+            continue
+        if pattern in path.read_text():
+            offenders.append(str(path.relative_to(src_root)))
+
+    assert offenders == [], f"Found hardcoded storage path pattern {pattern!r} in: {offenders}"

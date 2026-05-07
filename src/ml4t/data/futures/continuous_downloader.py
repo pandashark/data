@@ -25,7 +25,6 @@ Usage:
         products=["ES", "CL", "GC"],
         start="2011-01-01",
         end="2025-12-31",
-        storage_path="~/ml4t-data/futures/continuous",
         tenors=[0, 1, 2],
         schema="ohlcv-1h",
     )

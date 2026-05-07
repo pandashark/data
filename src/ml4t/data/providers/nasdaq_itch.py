@@ -62,7 +62,7 @@ class ITCHSampleProvider:
 
     # Download a sample file
     provider = ITCHSampleProvider()
-    path = provider.download("01302019")  # Downloads to ~/ml4t/data/itch/
+    path = provider.download("01302019")  # Downloads under the configured ML4T data root
 
     # List available files on NASDAQ server
     files = provider.list_available_files()
@@ -166,9 +166,9 @@ class ITCHSampleProvider:
 
         Args:
             download_path: Directory to store downloaded ITCH files
-                          (default: ~/ml4t/data/itch)
+                          (default: <data-root>/equities/nasdaq_itch)
             parsed_path: Directory containing pre-parsed message parquets
-                        (default: $ML4T_DATA_DIR/equities/nasdaq_itch/messages or ~/.ml4t/data/...)
+                        (default: <data-root>/equities/nasdaq_itch/messages)
         """
         self.logger = structlog.get_logger(name=self.__class__.__name__)
 

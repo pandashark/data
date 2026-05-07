@@ -304,7 +304,7 @@ def load_cot_config(config_path: str | Path) -> COTConfig:
           - GC
         start_year: 2020
         end_year: 2024
-        storage_path: ~/ml4t-data/cot
+        storage_path: data/cot
     """
     with open(config_path) as f:
         data = yaml.safe_load(f)
