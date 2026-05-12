@@ -4,7 +4,7 @@
 
 site_name: ML4T Data
 site_description: High-performance market data acquisition for quantitative finance
-site_url: https://ml4t.io/docs/data/
+site_url: https://www.ml4trading.io/docs/data/
 repo_url: https://github.com/ml4t/data
 repo_name: ml4t/data
 
@@ -168,7 +168,7 @@ nav:
 extra:
   social:
     - icon: fontawesome/brands/github
-      link: https://github.com/stefan-jansen
+      link: https://github.com/ml4t/data
     - icon: fontawesome/brands/twitter
       link: https://twitter.com/mlaboratory
 

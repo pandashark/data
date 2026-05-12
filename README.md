@@ -8,7 +8,7 @@ Unified market data acquisition and storage for quantitative research workflows.
 
 ## Part of the ML4T Library Ecosystem
 
-This library is one of six interconnected libraries supporting the machine learning for trading workflow described in [Machine Learning for Trading](https://ml4trading.io):
+This library is one of six interconnected libraries supporting the machine learning for trading workflow described in [Machine Learning for Trading](https://www.ml4trading.io):
 
 ![ML4T Library Ecosystem](docs/images/ml4t_ecosystem_workflow_color.png)
 
@@ -299,7 +299,7 @@ report = manager.detect(data)
 ## Development
 
 ```bash
-git clone https://github.com/ml4t/ml4t-data.git
+git clone https://github.com/ml4t/data.git
 cd ml4t-data
 uv sync
 uv run pytest tests/ -q
