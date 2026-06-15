@@ -15,7 +15,7 @@ from ml4t.data.core.exceptions import (
     NetworkError,
     RateLimitError,
 )
-from ml4t.data.providers.databento import DataBentoProvider
+from ml4t.data.providers.databento import OPRA_DATASET, DataBentoProvider
 
 
 class TestDataBentoProvider:
@@ -65,6 +65,12 @@ class TestDataBentoProvider:
         """Test provider name."""
         assert provider.name == "databento"
 
+    def test_capabilities_flags(self, provider):
+        """DataBentoProvider declares futures and options support."""
+        caps = provider.capabilities()
+        assert caps.supports_futures is True
+        assert caps.supports_options is True
+
     def test_fetch_raw_data_success(self, provider, mock_client):
         """Test successful raw data fetch."""
         # Mock response
@@ -93,6 +99,56 @@ class TestDataBentoProvider:
         call_args = mock_client.timeseries.get_range.call_args
         assert call_args.kwargs["symbols"] == ["ES.v.0"]
         assert call_args.kwargs["schema"] == "ohlcv-1d"
+
+    def test_fetch_raw_data_default_dataset_and_stype(self, provider, mock_client):
+        """Default path passes self.dataset and stype_in='raw_symbol'."""
+        mock_client.timeseries.get_range.return_value = Mock()
+
+        provider._fetch_raw_data("ES.v.0", "2024-01-01", "2024-01-31", "daily")
+
+        call_args = mock_client.timeseries.get_range.call_args
+        assert call_args.kwargs["dataset"] == "GLBX.MDP3"
+        assert call_args.kwargs["stype_in"] == "raw_symbol"
+
+    def test_fetch_raw_data_honors_overrides(self, provider, mock_client):
+        """dataset / stype_in / schema overrides are threaded into get_range."""
+        mock_client.timeseries.get_range.return_value = Mock()
+
+        provider._fetch_raw_data(
+            "SPXW  250321C05800000",
+            "2024-01-01",
+            "2024-01-31",
+            "minute",
+            dataset=OPRA_DATASET,
+            stype_in="parent",
+            schema="ohlcv-1m",
+        )
+
+        call_args = mock_client.timeseries.get_range.call_args
+        assert call_args.kwargs["dataset"] == "OPRA.PILLAR"
+        assert call_args.kwargs["stype_in"] == "parent"
+        assert call_args.kwargs["schema"] == "ohlcv-1m"
+        assert call_args.kwargs["symbols"] == ["SPXW  250321C05800000"]
+
+    def test_fetch_raw_data_does_not_mutate_dataset(self, provider, mock_client):
+        """R2: an override call must not clobber self.dataset."""
+        mock_client.timeseries.get_range.return_value = Mock()
+
+        provider._fetch_raw_data(
+            "SPXW  250321C05800000",
+            "2024-01-01",
+            "2024-01-31",
+            "minute",
+            dataset=OPRA_DATASET,
+            stype_in="raw_symbol",
+            schema="ohlcv-1m",
+        )
+
+        assert provider.dataset == "GLBX.MDP3"
+
+    def test_opra_dataset_constant(self):
+        """The OPRA dataset constant is the consolidated options feed."""
+        assert OPRA_DATASET == "OPRA.PILLAR"
 
     def test_fetch_raw_data_with_session_date_adjustment(self, mock_client):
         """Test that session date adjustment works when enabled."""
@@ -295,6 +351,113 @@ class TestDataBentoProvider:
         schemas = provider.get_available_schemas()
         assert schemas == ["ohlcv-1m", "trades", "tbbo"]
         mock_client.metadata.list_schemas.assert_called_once_with(dataset="GLBX.MDP3")
+
+    def test_get_billable_size_returns_value(self, provider, mock_client):
+        """get_billable_size returns the SDK int and defaults dataset to OPRA."""
+        mock_client.metadata.get_billable_size.return_value = 12345
+
+        size = provider.get_billable_size(
+            symbols=["SPX   250321C05800000"],
+            schema="ohlcv-1d",
+            start="2025-03-03",
+            end="2025-03-21",
+        )
+
+        assert size == 12345
+        call_args = mock_client.metadata.get_billable_size.call_args
+        assert call_args.kwargs["dataset"] == OPRA_DATASET
+        assert call_args.kwargs["stype_in"] == "raw_symbol"
+        assert call_args.kwargs["schema"] == "ohlcv-1d"
+
+    def test_get_billable_size_error_returns_zero(self, provider, mock_client):
+        """A metadata failure degrades to 0 rather than raising."""
+        mock_client.metadata.get_billable_size.side_effect = Exception("boom")
+        assert (
+            provider.get_billable_size(
+                symbols=["SPX   250321C05800000"],
+                schema="ohlcv-1d",
+                start="2025-03-03",
+                end="2025-03-21",
+            )
+            == 0
+        )
+
+    def test_get_cost_quote_returns_value(self, provider, mock_client):
+        """get_cost_quote wraps get_cost (not get_billable_size) and returns the float."""
+        mock_client.metadata.get_cost.return_value = 0.0001
+
+        cost = provider.get_cost_quote(
+            symbols=["SPX.OPT"],
+            stype_in="parent",
+            schema="trades",
+            start="2025-03-03",
+            end="2025-03-21",
+        )
+
+        assert cost == 0.0001
+        mock_client.metadata.get_cost.assert_called_once()
+        mock_client.metadata.get_billable_size.assert_not_called()
+
+    def test_get_cost_quote_error_returns_zero(self, provider, mock_client):
+        """A metadata failure degrades to 0.0 rather than raising."""
+        mock_client.metadata.get_cost.side_effect = Exception("boom")
+        assert (
+            provider.get_cost_quote(
+                symbols=["SPX.OPT"],
+                schema="trades",
+                start="2025-03-03",
+                end="2025-03-21",
+            )
+            == 0.0
+        )
+
+    def test_schema_available_from_happy_path(self, provider, mock_client):
+        """The nested per-schema start date is returned as YYYY-MM-DD."""
+        mock_client.metadata.get_dataset_range.return_value = {
+            "schema": {
+                "cbbo-1m": {
+                    "start": "2013-07-15T00:00:00.000000000Z",
+                    "end": "2025-06-13T00:00:00.000000000Z",
+                }
+            }
+        }
+        assert provider._schema_available_from("cbbo-1m", dataset=OPRA_DATASET) == "2013-07-15"
+
+    @pytest.mark.parametrize(
+        ("payload", "query"),
+        [
+            (["unexpected", "list"], "cbbo-1m"),  # top-level not a dict
+            ({"start": "2013-..."}, "cbbo-1m"),  # missing "schema" key
+            ({"schema": "oops"}, "cbbo-1m"),  # schema value not a dict
+            ({"schema": {"ohlcv-1d": {"start": "2013-..."}}}, "cbbo-1s"),  # target absent
+            ({"schema": {"cbbo-1m": {"end": "..."}}}, "cbbo-1m"),  # entry missing "start"
+            ({"schema": {"cbbo-1m": {"start": 12345}}}, "cbbo-1m"),  # start not a string
+        ],
+    )
+    def test_schema_available_from_malformed_returns_none(
+        self, provider, mock_client, payload, query
+    ):
+        """Payload-shape drift degrades to None instead of raising."""
+        mock_client.metadata.get_dataset_range.return_value = payload
+        assert provider._schema_available_from(query, dataset=OPRA_DATASET) is None
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            KeyError("x"),
+            TypeError("x"),
+            AttributeError("x"),
+            # Realistic SDK/network failures from the get_dataset_range call must also
+            # degrade to None (the broad except, not the isinstance guards, covers these).
+            BentoClientError("Unauthorized: Invalid API key"),
+            BentoServerError("Internal server error"),
+            Exception("connection reset"),
+        ],
+    )
+    def test_schema_available_from_sdk_error_returns_none(self, provider, mock_client, exc):
+        """An SDK / network exception degrades to None rather than propagating."""
+        mock_client.metadata.get_dataset_range.side_effect = exc
+        assert provider._schema_available_from("cbbo-1m", dataset=OPRA_DATASET) is None
 
     def test_error_handling_authentication(self, provider, mock_client):
         """Test authentication error handling."""

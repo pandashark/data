@@ -5,7 +5,12 @@ from datetime import UTC, datetime
 import polars as pl
 import pytest
 
-from ml4t.data.core.schemas import MultiAssetSchema, align_frames_for_concat
+from ml4t.data.core.schemas import (
+    MultiAssetSchema,
+    OptionChainSchema,
+    OptionQuoteSchema,
+    align_frames_for_concat,
+)
 
 
 class TestMultiAssetSchemaConstants:
@@ -740,3 +745,156 @@ class TestIntegration:
 
         df_cast = MultiAssetSchema.cast_to_schema(df)
         assert MultiAssetSchema.validate(df_cast) is True
+
+
+class TestOptionChainSchema:
+    """Test the option-chain (definition) schema constants and validation."""
+
+    @pytest.fixture
+    def valid_chain_df(self):
+        """Create a valid option-chain DataFrame."""
+        return pl.DataFrame(
+            {
+                "raw_symbol": ["SPXW  240105C04800000", "SPXW  240105P04800000"],
+                "instrument_class": ["C", "P"],
+                "strike_price": [4800.0, 4800.0],
+                "expiration": [
+                    datetime(2024, 1, 5, tzinfo=UTC),
+                    datetime(2024, 1, 5, tzinfo=UTC),
+                ],
+            }
+        )
+
+    def test_schema_has_required_columns(self):
+        """SCHEMA contains the expected chain columns."""
+        required = ["raw_symbol", "instrument_class", "strike_price", "expiration"]
+        assert set(OptionChainSchema.SCHEMA.keys()) == set(required)
+
+    def test_schema_data_types(self):
+        """SCHEMA pins the expected dtypes."""
+        assert OptionChainSchema.SCHEMA["raw_symbol"] == pl.Utf8
+        assert OptionChainSchema.SCHEMA["instrument_class"] == pl.Utf8
+        assert OptionChainSchema.SCHEMA["strike_price"] == pl.Float64
+        assert OptionChainSchema.SCHEMA["expiration"] == pl.Datetime("us", "UTC")
+
+    def test_optional_columns(self):
+        """instrument_id is an optional column."""
+        assert OptionChainSchema.OPTIONAL_COLUMNS["instrument_id"] == pl.Int64
+
+    def test_validate_valid_dataframe(self, valid_chain_df):
+        """A well-formed chain frame validates."""
+        assert OptionChainSchema.validate(valid_chain_df) is True
+
+    def test_validate_missing_column_strict(self, valid_chain_df):
+        """Missing required column raises in strict mode."""
+        df_missing = valid_chain_df.drop("strike_price")
+        with pytest.raises(ValueError, match="Missing required column: strike_price"):
+            OptionChainSchema.validate(df_missing, strict=True)
+
+    def test_validate_missing_column_non_strict(self, valid_chain_df):
+        """Missing required column returns False in non-strict mode."""
+        df_missing = valid_chain_df.drop("expiration")
+        assert OptionChainSchema.validate(df_missing, strict=False) is False
+
+    def test_validate_expiration_precision_agnostic(self, valid_chain_df):
+        """expiration is accepted at any datetime precision."""
+        df_ns = valid_chain_df.with_columns(pl.col("expiration").cast(pl.Datetime("ns", "UTC")))
+        assert OptionChainSchema.validate(df_ns) is True
+
+    def test_validate_wrong_strike_type_strict(self, valid_chain_df):
+        """Non-numeric strike raises in strict mode."""
+        df_wrong = valid_chain_df.with_columns(pl.col("strike_price").cast(pl.Utf8))
+        with pytest.raises(ValueError, match="Column 'strike_price' must be numeric"):
+            OptionChainSchema.validate(df_wrong, strict=True)
+
+    def test_validate_wrong_expiration_type_strict(self, valid_chain_df):
+        """Non-datetime expiration raises in strict mode."""
+        df_wrong = valid_chain_df.with_columns(pl.col("expiration").cast(pl.Utf8))
+        with pytest.raises(ValueError, match="Column 'expiration' must be Datetime"):
+            OptionChainSchema.validate(df_wrong, strict=True)
+
+    def test_create_empty(self):
+        """create_empty yields a typed empty frame."""
+        df = OptionChainSchema.create_empty()
+        assert df.height == 0
+        assert set(df.columns) == set(OptionChainSchema.SCHEMA.keys())
+
+    def test_create_empty_with_optional(self):
+        """create_empty(include_optional=True) adds instrument_id."""
+        df = OptionChainSchema.create_empty(include_optional=True)
+        assert "instrument_id" in df.columns
+
+
+class TestOptionQuoteSchema:
+    """Test the consolidated option-quote schema constants and validation."""
+
+    @pytest.fixture
+    def valid_quote_df(self):
+        """Create a valid option-quote DataFrame."""
+        return pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 5, 14, 30, tzinfo=UTC),
+                    datetime(2024, 1, 5, 14, 31, tzinfo=UTC),
+                ],
+                "bid_px_00": [12.50, 12.55],
+                "ask_px_00": [12.70, 12.75],
+                "spread": [0.20, 0.20],
+                "bid_sz_00": [10, 12],
+                "ask_sz_00": [8, 9],
+            }
+        )
+
+    def test_schema_has_required_columns(self):
+        """SCHEMA contains the expected quote columns."""
+        required = ["timestamp", "bid_px_00", "ask_px_00", "spread", "bid_sz_00", "ask_sz_00"]
+        assert set(OptionQuoteSchema.SCHEMA.keys()) == set(required)
+
+    def test_schema_data_types(self):
+        """SCHEMA pins the expected dtypes."""
+        assert OptionQuoteSchema.SCHEMA["timestamp"] == pl.Datetime("us", "UTC")
+        assert OptionQuoteSchema.SCHEMA["bid_px_00"] == pl.Float64
+        assert OptionQuoteSchema.SCHEMA["ask_px_00"] == pl.Float64
+        assert OptionQuoteSchema.SCHEMA["spread"] == pl.Float64
+        assert OptionQuoteSchema.SCHEMA["bid_sz_00"] == pl.Int64
+        assert OptionQuoteSchema.SCHEMA["ask_sz_00"] == pl.Int64
+
+    def test_validate_valid_dataframe(self, valid_quote_df):
+        """A well-formed quote frame validates."""
+        assert OptionQuoteSchema.validate(valid_quote_df) is True
+
+    def test_validate_missing_column_strict(self, valid_quote_df):
+        """Missing required column raises in strict mode."""
+        df_missing = valid_quote_df.drop("spread")
+        with pytest.raises(ValueError, match="Missing required column: spread"):
+            OptionQuoteSchema.validate(df_missing, strict=True)
+
+    def test_validate_missing_column_non_strict(self, valid_quote_df):
+        """Missing required column returns False in non-strict mode."""
+        df_missing = valid_quote_df.drop("bid_px_00")
+        assert OptionQuoteSchema.validate(df_missing, strict=False) is False
+
+    def test_validate_float_sizes_accepted(self, valid_quote_df):
+        """Float-typed sizes pass the numeric compatibility check."""
+        df_float = valid_quote_df.with_columns(
+            pl.col("bid_sz_00").cast(pl.Float64),
+            pl.col("ask_sz_00").cast(pl.Float64),
+        )
+        assert OptionQuoteSchema.validate(df_float) is True
+
+    def test_validate_timestamp_precision_agnostic(self, valid_quote_df):
+        """timestamp is accepted at any datetime precision."""
+        df_ns = valid_quote_df.with_columns(pl.col("timestamp").cast(pl.Datetime("ns", "UTC")))
+        assert OptionQuoteSchema.validate(df_ns) is True
+
+    def test_validate_wrong_price_type_strict(self, valid_quote_df):
+        """Non-numeric price raises in strict mode."""
+        df_wrong = valid_quote_df.with_columns(pl.col("bid_px_00").cast(pl.Utf8))
+        with pytest.raises(ValueError, match="Column 'bid_px_00' must be numeric"):
+            OptionQuoteSchema.validate(df_wrong, strict=True)
+
+    def test_create_empty(self):
+        """create_empty yields a typed empty frame."""
+        df = OptionQuoteSchema.create_empty()
+        assert df.height == 0
+        assert set(df.columns) == set(OptionQuoteSchema.SCHEMA.keys())

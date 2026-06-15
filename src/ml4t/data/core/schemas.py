@@ -421,3 +421,164 @@ class MultiAssetSchema:
         if cast_exprs:
             return df.with_columns(cast_exprs)
         return df
+
+
+# Numeric dtypes accepted by the schema validators (mirrors MultiAssetSchema's
+# OHLCV compatibility list — exact dtype equality is intentionally NOT required).
+_NUMERIC_DTYPES = (pl.Float64, pl.Float32, pl.Int64, pl.Int32, pl.UInt64, pl.UInt32)
+
+
+class OptionChainSchema:
+    """Lightweight schema for an option-chain (definition) frame.
+
+    This is the non-OHLCV frame returned by ``DataBentoProvider.fetch_option_chain``.
+    It is sourced from Databento's ``schema="definition"`` records and MUST NOT be
+    routed through ``MultiAssetSchema.validate`` / the OHLCV validation path — it has
+    no price/volume columns. These constants pin the column names and dtypes so the
+    provider method has something to conform to and test against.
+
+    Attributes:
+        SCHEMA: Required columns. ``raw_symbol`` is the OSI 21-char contract string,
+            ``instrument_class`` is ``"C"``/``"P"``, ``strike_price`` is the numeric
+            strike, and ``expiration`` is the contract expiry modelled as a UTC
+            datetime (validated precision-agnostically as any ``pl.Datetime``).
+        OPTIONAL_COLUMNS: ``instrument_id`` (Databento's numeric id, used for joins).
+    """
+
+    SCHEMA: ClassVar[dict[str, pl.DataType]] = {
+        "raw_symbol": pl.Utf8,
+        "instrument_class": pl.Utf8,
+        "strike_price": pl.Float64,
+        "expiration": pl.Datetime("us", "UTC"),
+    }
+
+    OPTIONAL_COLUMNS: ClassVar[dict[str, pl.DataType]] = {
+        "instrument_id": pl.Int64,
+    }
+
+    @classmethod
+    def validate(cls, df: pl.DataFrame, strict: bool = True) -> bool:
+        """Validate that a DataFrame conforms to the option-chain schema.
+
+        Checks required columns are present and dtype-compatible. ``expiration`` is
+        accepted as any ``pl.Datetime`` (precision-agnostic), ``strike_price`` as any
+        numeric type, and the string columns as ``Utf8``/``Categorical``.
+
+        Args:
+            df: DataFrame to validate.
+            strict: If True, raise ``ValueError`` on failure; otherwise return False.
+
+        Returns:
+            True if valid.
+
+        Raises:
+            ValueError: If validation fails and strict=True.
+        """
+        missing_cols = set(cls.SCHEMA.keys()) - set(df.columns)
+        if missing_cols:
+            if strict:
+                raise ValueError(f"Missing required column: {sorted(missing_cols)[0]}")
+            return False
+
+        for col in cls.SCHEMA:
+            actual_dtype = df[col].dtype
+            if col == "expiration":
+                if not isinstance(actual_dtype, pl.Datetime):
+                    if strict:
+                        raise ValueError(f"Column '{col}' must be Datetime, got {actual_dtype}")
+                    return False
+            elif col == "strike_price":
+                if actual_dtype not in _NUMERIC_DTYPES:
+                    if strict:
+                        raise ValueError(f"Column '{col}' must be numeric, got {actual_dtype}")
+                    return False
+            elif actual_dtype not in (pl.Utf8, pl.Categorical):
+                if strict:
+                    raise ValueError(f"Column '{col}' must be string type, got {actual_dtype}")
+                return False
+
+        return True
+
+    @classmethod
+    def create_empty(cls, include_optional: bool = False) -> pl.DataFrame:
+        """Create an empty DataFrame with the option-chain schema.
+
+        Args:
+            include_optional: If True, also include ``OPTIONAL_COLUMNS``.
+
+        Returns:
+            Empty DataFrame with the chain schema.
+        """
+        schema = cls.SCHEMA.copy()
+        if include_optional:
+            schema.update(cls.OPTIONAL_COLUMNS)
+        return pl.DataFrame(schema=schema)
+
+
+class OptionQuoteSchema:
+    """Lightweight schema for a consolidated option bid/ask quote frame.
+
+    This is the non-OHLCV frame returned (Phase 2) by
+    ``DataBentoProvider.fetch_option_quotes``. It is sourced from Databento
+    consolidated quote schemas (e.g. ``cbbo-1m``) and, like the chain frame, MUST NOT
+    be routed through the OHLCV validation path.
+
+    Attributes:
+        SCHEMA: Required columns. ``timestamp`` is the sampling clock sourced from
+            ``ts_recv`` (``ts_event`` can be stale/repeat), validated as any
+            ``pl.Datetime``. ``spread`` is ``ask_px_00 - bid_px_00``. Size columns
+            are modelled as ``Int64`` but validated against the numeric compatibility
+            list, so float sizes also pass.
+    """
+
+    SCHEMA: ClassVar[dict[str, pl.DataType]] = {
+        "timestamp": pl.Datetime("us", "UTC"),
+        "bid_px_00": pl.Float64,
+        "ask_px_00": pl.Float64,
+        "spread": pl.Float64,
+        "bid_sz_00": pl.Int64,
+        "ask_sz_00": pl.Int64,
+    }
+
+    @classmethod
+    def validate(cls, df: pl.DataFrame, strict: bool = True) -> bool:
+        """Validate that a DataFrame conforms to the option-quote schema.
+
+        Checks required columns are present and dtype-compatible. ``timestamp`` is
+        accepted as any ``pl.Datetime`` (precision-agnostic); all price and size
+        columns are accepted as any numeric type.
+
+        Args:
+            df: DataFrame to validate.
+            strict: If True, raise ``ValueError`` on failure; otherwise return False.
+
+        Returns:
+            True if valid.
+
+        Raises:
+            ValueError: If validation fails and strict=True.
+        """
+        missing_cols = set(cls.SCHEMA.keys()) - set(df.columns)
+        if missing_cols:
+            if strict:
+                raise ValueError(f"Missing required column: {sorted(missing_cols)[0]}")
+            return False
+
+        for col in cls.SCHEMA:
+            actual_dtype = df[col].dtype
+            if col == "timestamp":
+                if not isinstance(actual_dtype, pl.Datetime):
+                    if strict:
+                        raise ValueError(f"Column '{col}' must be Datetime, got {actual_dtype}")
+                    return False
+            elif actual_dtype not in _NUMERIC_DTYPES:
+                if strict:
+                    raise ValueError(f"Column '{col}' must be numeric, got {actual_dtype}")
+                return False
+
+        return True
+
+    @classmethod
+    def create_empty(cls) -> pl.DataFrame:
+        """Create an empty DataFrame with the option-quote schema."""
+        return pl.DataFrame(schema=cls.SCHEMA.copy())

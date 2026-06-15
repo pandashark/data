@@ -38,6 +38,7 @@ class ProviderCapabilities:
         supports_crypto: Handles cryptocurrency symbols
         supports_forex: Handles forex pairs
         supports_futures: Handles futures contracts
+        supports_options: Handles options contracts
         requires_api_key: Needs authentication
         max_history_days: Maximum historical data available
         rate_limit: (calls, period_seconds) tuple
@@ -47,6 +48,7 @@ class ProviderCapabilities:
     supports_crypto: bool = False
     supports_forex: bool = False
     supports_futures: bool = False
+    supports_options: bool = False
     requires_api_key: bool = False
     max_history_days: int | None = None
     rate_limit: tuple[int, float] = (60, 60.0)
