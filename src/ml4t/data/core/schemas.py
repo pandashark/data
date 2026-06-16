@@ -582,3 +582,87 @@ class OptionQuoteSchema:
     def create_empty(cls) -> pl.DataFrame:
         """Create an empty DataFrame with the option-quote schema."""
         return pl.DataFrame(schema=cls.SCHEMA.copy())
+
+
+class OptionChainQuoteSchema:
+    """Lightweight schema for a whole-chain consolidated option quote frame.
+
+    This is the windowed, multi-contract sibling of ``OptionQuoteSchema``. It is the
+    non-OHLCV frame returned (in a later phase) by
+    ``DataBentoProvider.fetch_option_chain_quotes``, which pulls a parent symbol's entire
+    option chain (e.g. ``SPX.OPT``) for an intraday window in a single request. Because the
+    frame interleaves many contracts, every row carries a contract identifier — unlike
+    ``OptionQuoteSchema``, which is single-contract and needs none. Like the other non-OHLCV
+    frames, it MUST NOT be routed through ``MultiAssetSchema.validate`` / ``_validate_ohlcv``.
+
+    Attributes:
+        SCHEMA: Required columns. ``timestamp`` is the sampling clock sourced from
+            ``ts_recv`` (validated as any ``pl.Datetime``). ``instrument_id`` is the
+            Databento integer id and is ALWAYS present. ``raw_symbol`` is the resolved OSI
+            21-char contract symbol; it is a required COLUMN but its VALUES may be null when
+            an id could not be resolved — ``validate`` checks dtype, not values, so a
+            Utf8-typed all-null ``raw_symbol`` passes (a producer must keep it ``Utf8``-typed
+            rather than letting an all-null list infer ``pl.Null``). ``spread`` is
+            ``ask_px_00 - bid_px_00``. Size columns are modelled as ``Int64`` but validated
+            against the numeric compatibility list, so float sizes also pass.
+    """
+
+    SCHEMA: ClassVar[dict[str, pl.DataType]] = {
+        "timestamp": pl.Datetime("us", "UTC"),
+        "instrument_id": pl.Int64,
+        "raw_symbol": pl.Utf8,
+        "bid_px_00": pl.Float64,
+        "ask_px_00": pl.Float64,
+        "spread": pl.Float64,
+        "bid_sz_00": pl.Int64,
+        "ask_sz_00": pl.Int64,
+    }
+
+    @classmethod
+    def validate(cls, df: pl.DataFrame, strict: bool = True) -> bool:
+        """Validate that a DataFrame conforms to the chain-quote schema.
+
+        Checks required columns are present and dtype-compatible. ``timestamp`` is accepted
+        as any ``pl.Datetime`` (precision-agnostic); ``raw_symbol`` as ``pl.Utf8`` or
+        ``pl.Categorical`` (null values are permitted); all price/size/``instrument_id``
+        columns as any numeric type.
+
+        Args:
+            df: DataFrame to validate.
+            strict: If True, raise ``ValueError`` on failure; otherwise return False.
+
+        Returns:
+            True if valid.
+
+        Raises:
+            ValueError: If validation fails and strict=True.
+        """
+        missing_cols = set(cls.SCHEMA.keys()) - set(df.columns)
+        if missing_cols:
+            if strict:
+                raise ValueError(f"Missing required column: {sorted(missing_cols)[0]}")
+            return False
+
+        for col in cls.SCHEMA:
+            actual_dtype = df[col].dtype
+            if col == "timestamp":
+                if not isinstance(actual_dtype, pl.Datetime):
+                    if strict:
+                        raise ValueError(f"Column '{col}' must be Datetime, got {actual_dtype}")
+                    return False
+            elif col == "raw_symbol":
+                if actual_dtype not in (pl.Utf8, pl.Categorical):
+                    if strict:
+                        raise ValueError(f"Column '{col}' must be string type, got {actual_dtype}")
+                    return False
+            elif actual_dtype not in _NUMERIC_DTYPES:
+                if strict:
+                    raise ValueError(f"Column '{col}' must be numeric, got {actual_dtype}")
+                return False
+
+        return True
+
+    @classmethod
+    def create_empty(cls) -> pl.DataFrame:
+        """Create an empty DataFrame with the chain-quote schema."""
+        return pl.DataFrame(schema=cls.SCHEMA.copy())

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Literal
 
 import polars as pl
@@ -52,10 +52,18 @@ class ValidationMixin:
     ) -> None:
         """Validate input parameters.
 
+        Accepts the full ISO-8601 grammar that ``datetime.fromisoformat`` parses, not just
+        ``YYYY-MM-DD`` — date-only, datetime, ``Z``/offset, space- or ``T``-separated, and basic
+        (unhyphenated) forms all pass. This intentionally broadens the shared contract beyond the
+        old ``strptime("%Y-%m-%d")`` check so OPRA intraday windowing can thread datetimes through
+        ``start``/``end``; providers that forward bounds to date-only upstream APIs still receive
+        the original string verbatim and surface any narrower constraint downstream.
+
         Args:
             symbol: Symbol to fetch
-            start: Start date (YYYY-MM-DD)
-            end: End date (YYYY-MM-DD)
+            start: Start bound, an ISO-8601 date ("YYYY-MM-DD") or datetime
+                ("YYYY-MM-DDTHH:MM[:SS][+offset]")
+            end: End bound, same ISO-8601 date-or-datetime form as ``start``
             frequency: Data frequency
 
         Raises:
@@ -65,13 +73,40 @@ class ValidationMixin:
             raise ValueError("Symbol cannot be empty")
 
         try:
-            start_dt = datetime.strptime(start, "%Y-%m-%d")
-            end_dt = datetime.strptime(end, "%Y-%m-%d")
+            start_dt = self._parse_iso_bound(start, is_end=False)
+            end_dt = self._parse_iso_bound(end, is_end=True)
         except ValueError as e:
-            raise ValueError(f"Invalid date format (expected YYYY-MM-DD): {e}") from e
+            raise ValueError(
+                f"Invalid date format (expected ISO-8601 date or datetime): {e}"
+            ) from e
 
         if start_dt > end_dt:
             raise ValueError("Start date must be before or equal to end date")
+
+    @staticmethod
+    def _parse_iso_bound(value: str, *, is_end: bool) -> datetime:
+        """Parse an ISO-8601 date or datetime into a UTC-aware datetime for comparison.
+
+        Applies the SAME date-only floor/ceil convention as the fetch path
+        (``DataBentoProvider._resolve_request_bound``) so validation accepts exactly the windows
+        the fetch builds: a date-only ``start`` floors to 00:00:00 and a date-only ``end`` ceils
+        to 23:59:59. Without this, a same-day window with an intraday ``start`` and a date-only
+        ``end`` (e.g. ``"...T19:50"`` .. ``"<date>"``) would be wrongly rejected as
+        ``start > end`` even though the fetch would build a valid ``19:50 -> 23:59:59`` window.
+        An explicit time component is honored verbatim. Naive values are treated as UTC; tz-aware
+        values are converted to UTC (comparing a naive and a tz-aware datetime would raise
+        ``TypeError``). Date-only vs explicit-time is decided from the INPUT STRING.
+        """
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is not None:
+            return dt.astimezone(UTC)
+        if "T" not in value and " " not in value:
+            dt = (
+                dt.replace(hour=23, minute=59, second=59)
+                if is_end
+                else dt.replace(hour=0, minute=0, second=0)
+            )
+        return dt.replace(tzinfo=UTC)
 
     def _validate_ohlcv(
         self,

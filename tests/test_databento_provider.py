@@ -1,6 +1,7 @@
 """Tests for Databento provider implementation."""
 
 import os
+from datetime import UTC
 from unittest.mock import Mock, patch
 
 import pandas as pd
@@ -192,6 +193,145 @@ class TestDataBentoProvider:
         assert start_dt.month == 1
         assert start_dt.year == 2024
         assert start_dt.hour == 0
+
+    def test_fetch_raw_data_date_only_floor_ceil(self, provider, mock_client):
+        """Date-only bounds keep the historical whole-day window (regression for D1).
+
+        start floors to 00:00:00 UTC, end ceils to 23:59:59 UTC — byte-identical to the
+        pre-ISO behavior.
+        """
+        mock_client.timeseries.get_range.return_value = Mock()
+
+        provider._fetch_raw_data("AAPL", "2024-01-01", "2024-01-05", "daily")
+
+        kwargs = mock_client.timeseries.get_range.call_args.kwargs
+        start_dt, end_dt = kwargs["start"], kwargs["end"]
+        assert (start_dt.hour, start_dt.minute, start_dt.second) == (0, 0, 0)
+        assert start_dt.tzinfo == UTC
+        assert (end_dt.year, end_dt.month, end_dt.day) == (2024, 1, 5)
+        assert (end_dt.hour, end_dt.minute, end_dt.second) == (23, 59, 59)
+        assert end_dt.tzinfo == UTC
+
+    def test_fetch_raw_data_intraday_datetime_unfloored(self, provider, mock_client):
+        """An explicit intraday datetime window reaches get_range UNFLOORED (D1).
+
+        This is the windowed cbbo-1m use case: a ~20-min snapshot around the cash close,
+        not a whole session day.
+        """
+        mock_client.timeseries.get_range.return_value = Mock()
+
+        provider._fetch_raw_data(
+            "SPX.OPT",
+            "2025-03-03T19:50:00",
+            "2025-03-03T20:10:00",
+            dataset=OPRA_DATASET,
+            stype_in="parent",
+            schema="cbbo-1m",
+        )
+
+        kwargs = mock_client.timeseries.get_range.call_args.kwargs
+        start_dt, end_dt = kwargs["start"], kwargs["end"]
+        assert (start_dt.hour, start_dt.minute, start_dt.second) == (19, 50, 0)
+        assert (end_dt.hour, end_dt.minute, end_dt.second) == (20, 10, 0)
+        assert start_dt.tzinfo == UTC and end_dt.tzinfo == UTC
+
+    def test_fetch_raw_data_tzaware_datetime_converted_to_utc(self, provider, mock_client):
+        """A tz-aware (offset) datetime bound is converted to UTC, not floored."""
+        mock_client.timeseries.get_range.return_value = Mock()
+
+        # 14:30 at -05:00 == 19:30 UTC
+        provider._fetch_raw_data(
+            "SPX.OPT",
+            "2025-03-03T14:30:00-05:00",
+            "2025-03-03T15:10:00-05:00",
+            dataset=OPRA_DATASET,
+            stype_in="parent",
+            schema="cbbo-1m",
+        )
+
+        kwargs = mock_client.timeseries.get_range.call_args.kwargs
+        start_dt = kwargs["start"]
+        assert start_dt.tzinfo == UTC
+        assert (start_dt.hour, start_dt.minute) == (19, 30)
+
+    def test_session_adjust_with_intraday_datetime_preserves_opra_guard(self, mock_client):
+        """The CME session shift still skips OPRA even when an intraday datetime is passed."""
+        with patch("ml4t.data.providers.databento.Historical") as mock_historical:
+            mock_historical.return_value = mock_client
+            provider = DataBentoProvider(
+                api_key="test_key",
+                adjust_session_dates=True,
+                session_start_hour_utc=22,
+            )
+            provider.client = mock_client
+            mock_client.timeseries.get_range.return_value = Mock()
+
+            provider._fetch_raw_data(
+                "SPX.OPT",
+                "2025-03-03T19:50:00",
+                "2025-03-03T20:10:00",
+                dataset=OPRA_DATASET,
+                stype_in="parent",
+                schema="cbbo-1m",
+            )
+
+            start_dt = mock_client.timeseries.get_range.call_args.kwargs["start"]
+            # OPRA path is NOT shifted back a day; the intraday time is honored.
+            assert (start_dt.year, start_dt.month, start_dt.day) == (2025, 3, 3)
+            assert (start_dt.hour, start_dt.minute) == (19, 50)
+
+    def test_validate_inputs_accepts_iso_datetime(self, provider):
+        """_validate_inputs accepts ISO datetimes and still rejects malformed/inverted ranges."""
+        # Accepts a same-day intraday window (no raise).
+        provider._validate_inputs("SPX.OPT", "2025-03-03T19:50", "2025-03-03T20:10", "cbbo-1m")
+        # Accepts a mixed date / tz-aware datetime without a naive-vs-aware TypeError.
+        provider._validate_inputs("SPX.OPT", "2025-03-03", "2025-03-03T20:10:00Z", "cbbo-1m")
+        # Still rejects malformed strings with the asserted substring.
+        with pytest.raises(ValueError, match="Invalid date format"):
+            provider._validate_inputs("AAPL", "2024/01/01", "2024-01-05", "daily")
+        # Still rejects start after end.
+        with pytest.raises(ValueError, match="Start date must be before"):
+            provider._validate_inputs("AAPL", "2025-03-03T20:10", "2025-03-03T19:50", "cbbo-1m")
+
+    def test_validate_inputs_intraday_start_date_only_end_same_day(self, provider):
+        """An intraday start with a date-only end on the same day validates (matches fetch).
+
+        Regression: _validate_inputs must ceil a date-only end to 23:59:59 like
+        _resolve_request_bound, so it accepts exactly the window _fetch_raw_data builds. Without
+        the aligned ceil, "T19:50" > date-only midnight would spuriously reject a valid window.
+        """
+        # Same-day: intraday start, date-only end -> end ceils to 23:59:59, so 19:50 <= 23:59:59.
+        provider._validate_inputs("SPX.OPT", "2025-03-03T19:50", "2025-03-03", "cbbo-1m")
+        # And _fetch_raw_data builds the matching 19:50 -> 23:59:59 window for that same input.
+        provider.client.timeseries.get_range.return_value = Mock()
+        provider._fetch_raw_data(
+            "SPX.OPT",
+            "2025-03-03T19:50",
+            "2025-03-03",
+            dataset=OPRA_DATASET,
+            stype_in="parent",
+            schema="cbbo-1m",
+        )
+        kwargs = provider.client.timeseries.get_range.call_args.kwargs
+        assert (kwargs["start"].hour, kwargs["start"].minute) == (19, 50)
+        assert (kwargs["end"].hour, kwargs["end"].minute, kwargs["end"].second) == (23, 59, 59)
+
+    def test_parse_iso_bound_floor_and_ceil_branches(self, provider):
+        """Both date-only branches of _parse_iso_bound are locked: start floors, end ceils.
+
+        Mirrors _resolve_request_bound so validation accepts exactly the windows the fetch
+        builds; an explicit time component is honored verbatim on both sides.
+        """
+        floor = provider._parse_iso_bound("2025-03-03", is_end=False)
+        ceil = provider._parse_iso_bound("2025-03-03", is_end=True)
+        assert (floor.hour, floor.minute, floor.second) == (0, 0, 0)
+        assert floor.tzinfo == UTC
+        assert (ceil.hour, ceil.minute, ceil.second) == (23, 59, 59)
+        assert ceil.tzinfo == UTC
+        # An explicit time is honored verbatim regardless of is_end (no floor/ceil applied).
+        for is_end in (False, True):
+            dt = provider._parse_iso_bound("2025-03-03T19:50:00", is_end=is_end)
+            assert (dt.hour, dt.minute, dt.second) == (19, 50, 0)
 
     def test_transform_data_ohlcv(self, provider):
         """Test transforming OHLCV data to standard schema."""

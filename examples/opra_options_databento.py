@@ -5,8 +5,10 @@ example drives the shipped ``DataBentoProvider`` option API end to end:
 
     provider.get_cost_quote / get_billable_size   -> FREE pre-flight sizing
     provider.fetch_option_chain(...)              -> definition/reference layer (+ filters)
-    provider.fetch_option_quotes(...)             -> consolidated bid/ask (publisher 30)
+    provider.fetch_option_quotes(...)             -> consolidated bid/ask, ONE contract (pub 30)
     provider.fetch_option_ohlcv(...)              -> per-contract OHLCV (venues consolidated)
+    provider.fetch_option_chain_quotes(...)       -> consolidated bid/ask, WHOLE chain, windowed
+                                                     + cost-guarded (see the windowed example below)
 
 WHY COST-CHECK FIRST: OPRA is the high-volume schema family. Unlike CME OHLCV (where a
 year of ES minute bars quotes at ~$0), an OPRA *chain* trades query can be large fast — a
@@ -59,6 +61,11 @@ Usage:
     # Download the single contract's daily bars (small, after you see the quote):
     python examples/opra_options_databento.py --download --frequency daily \
         --contract "SPX   250321C05800000" --start 2025-03-03 --end 2025-03-21
+
+    # WHOLE-chain consolidated quotes for a short intraday window (the cost-guarded path) live
+    # in a dedicated example — it drives provider.fetch_option_chain_quotes end to end:
+    python examples/opra_chain_quotes_windowed_pull.py --root SPX \
+        --start 2024-05-15T19:50:00 --end 2024-05-15T20:10:00 --dry-run
 """
 
 from __future__ import annotations
@@ -113,6 +120,11 @@ def cost_check(
     print(
         "\n  (cost quotes use the SDK's default feed mode; batch mode is cheaper for large "
         "pulls and depends on your entitlement tier)"
+    )
+    print(
+        "  whole-chain quotes are the cost trap above — the sanctioned way to pull them is a\n"
+        "  short intraday WINDOW via provider.fetch_option_chain_quotes (one stype_in='parent'\n"
+        "  request, availability- and cost-guarded). See examples/opra_chain_quotes_windowed_pull.py."
     )
 
 

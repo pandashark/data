@@ -2,8 +2,14 @@
 
 from ml4t.data.core.schemas import (
     MultiAssetSchema,
+    OptionChainQuoteSchema,
     OptionChainSchema,
     OptionQuoteSchema,
 )
 
-__all__ = ["MultiAssetSchema", "OptionChainSchema", "OptionQuoteSchema"]
+__all__ = [
+    "MultiAssetSchema",
+    "OptionChainQuoteSchema",
+    "OptionChainSchema",
+    "OptionQuoteSchema",
+]

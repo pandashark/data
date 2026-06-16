@@ -23,11 +23,16 @@ from databento.common.error import BentoClientError, BentoServerError
 
 from ml4t.data.core.exceptions import (
     AuthenticationError,
+    CostLimitError,
     DataNotAvailableError,
     NetworkError,
     RateLimitError,
 )
-from ml4t.data.core.schemas import OptionChainSchema, OptionQuoteSchema
+from ml4t.data.core.schemas import (
+    OptionChainQuoteSchema,
+    OptionChainSchema,
+    OptionQuoteSchema,
+)
 from ml4t.data.providers.base import BaseProvider, ProviderCapabilities
 
 logger = structlog.get_logger()
@@ -254,8 +259,11 @@ class DataBentoProvider(BaseProvider):
 
         Args:
             symbol: Symbol / raw contract string to fetch.
-            start: Start date (YYYY-MM-DD).
-            end: End date (YYYY-MM-DD).
+            start: Start bound — ISO-8601 date (``YYYY-MM-DD``, floored to 00:00:00 UTC) or
+                datetime (``YYYY-MM-DDTHH:MM[:SS][+offset]``, honored verbatim for an intraday
+                window).
+            end: End bound — ISO-8601 date (``YYYY-MM-DD``, ceiled to 23:59:59 UTC) or datetime
+                (honored verbatim), same form as ``start``.
             frequency: Human frequency; mapped to a schema when ``schema`` is not given.
             dataset: Optional per-call dataset override (e.g. ``OPRA_DATASET``). Defaults to
                 ``self.dataset``; the instance attribute is never mutated (R2).
@@ -270,13 +278,12 @@ class DataBentoProvider(BaseProvider):
         resolved_dataset = dataset if dataset is not None else self.dataset
         resolved_stype_in = stype_in if stype_in is not None else "raw_symbol"
 
-        # Parse dates
-        start_dt = datetime.strptime(start, "%Y-%m-%d").replace(
-            hour=0, minute=0, second=0, tzinfo=UTC
-        )
-        end_dt = datetime.strptime(end, "%Y-%m-%d").replace(
-            hour=23, minute=59, second=59, tzinfo=UTC
-        )
+        # Parse start/end as ISO-8601 date OR datetime. A date-only bound keeps the historical
+        # whole-day window (start floored to 00:00:00, end ceiled to 23:59:59 UTC); an explicit
+        # time component is honored verbatim so callers can request an intraday window (e.g. the
+        # ~20-min cbbo-1m snapshot around the cash close) instead of a full session day.
+        start_dt = self._resolve_request_bound(start, is_end=False)
+        end_dt = self._resolve_request_bound(end, is_end=True)
 
         # Adjust for session dates if enabled (for futures with CME session logic)
         # The CME maintenance-break shift is futures-only; never apply it to OPRA option calls.
@@ -329,6 +336,29 @@ class DataBentoProvider(BaseProvider):
                 provider=self.name,
                 message=f"Failed to fetch data from Databento: {e}",
             )
+
+    @staticmethod
+    def _resolve_request_bound(value: str, *, is_end: bool) -> datetime:
+        """Parse an ISO-8601 date or datetime into a UTC request bound.
+
+        A date-only string (no ``T``/space time separator) keeps the historical whole-day
+        window: the start bound floors to ``00:00:00`` and the end bound ceils to ``23:59:59``.
+        An explicit time component is honored verbatim — a naive value is treated as UTC, a
+        tz-aware value (``Z``/offset) is converted to UTC — so a caller can request an intraday
+        window instead of a full session day. A bare date and an explicit midnight datetime
+        parse to the same value, so the date-only floor/ceil is decided from the INPUT STRING,
+        not the parsed datetime.
+        """
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is not None:
+            return dt.astimezone(UTC)
+        if "T" not in value and " " not in value:
+            dt = (
+                dt.replace(hour=23, minute=59, second=59)
+                if is_end
+                else dt.replace(hour=0, minute=0, second=0)
+            )
+        return dt.replace(tzinfo=UTC)
 
     def _transform_data(self, raw_data: Any, symbol: str) -> pl.DataFrame:
         """Transform Databento data to standard schema."""
@@ -807,8 +837,10 @@ class DataBentoProvider(BaseProvider):
         ``self.dataset`` is never mutated (the OPRA dataset is passed per call, R2).
 
         Cost: consolidated quotes are billed but small (~$0.0001 for one contract/day of
-        ``cbbo-1m``); the availability metadata call is free. This is per single contract only —
-        a whole-chain quote pull is a deliberate non-goal (cost trap); never auto-loop a chain.
+        ``cbbo-1m``); the availability metadata call is free. This is per single contract only.
+        For the WHOLE chain's quotes, use ``fetch_option_chain_quotes`` (one ``stype_in="parent"``
+        request, intraday-windowed and ``max_cost_usd``-guarded) — never auto-loop this
+        single-contract method across a chain (that remains a cost trap).
 
         Args:
             contract: OSI 21-char raw_symbol, e.g. "SPX   250321C05800000".
@@ -901,6 +933,228 @@ class DataBentoProvider(BaseProvider):
         # Conform to OptionQuoteSchema: cast the columns present, then back-fill the ones the
         # (sparse) response omitted with typed nulls so a populated frame always validates.
         schema = OptionQuoteSchema.SCHEMA
+        df = df.with_columns([pl.col(c).cast(dt) for c, dt in schema.items() if c in df.columns])
+        fills = [pl.lit(None, dtype=dt).alias(c) for c, dt in schema.items() if c not in df.columns]
+        if fills:
+            df = df.with_columns(fills)
+        return df.select(list(schema.keys()))
+
+    def fetch_option_chain_quotes(
+        self,
+        underlying: str,
+        start: str,
+        end: str,
+        *,
+        schema: str = "cbbo-1m",
+        max_cost_usd: float | None = None,
+    ) -> pl.DataFrame:
+        """Fetch consolidated bid/ask quotes for an ENTIRE OPRA option chain in one request.
+
+        This is the sanctioned, windowed, cost-guarded way to pull whole-chain quotes — the
+        responsible counterpart to ``fetch_option_quotes`` (single contract). It issues a
+        SINGLE ``stype_in="parent"`` request against the ``<underlying>.OPT`` parent symbol, so
+        every listed contract's consolidated quotes come back together. ``self.dataset`` is
+        never mutated (the OPRA dataset is passed per call, R2).
+
+        Intraday windowing is the cost lever. Pass ISO *datetimes* in ``start``/``end`` (e.g.
+        ``"2025-03-03T19:50:00"`` .. ``"2025-03-03T20:10:00"``) to bill only the ~20-min window
+        around the cash close instead of a whole session day — Databento bills on bytes
+        returned, so a full-day whole-chain pull is ~20x a windowed one. Date-only bounds keep
+        the whole-day window (see ``_fetch_raw_data``).
+
+        Row identity: a parent ``cbbo`` response identifies each contract by the integer
+        ``instrument_id`` (NOT the OSI symbol). The OSI ``raw_symbol`` is resolved by a join
+        against the definition chain (``fetch_option_chain``) for the SAME window — OPRA
+        ``instrument_id``s roll at session/publication boundaries, so the definition pull must
+        cover the window the quotes came from. Each row carries BOTH ``instrument_id`` (always)
+        and ``raw_symbol`` (null when an id has no definition match). Rows are NOT deduped across
+        ``instrument_id`` — the parent pull interleaves many contracts.
+
+        Availability is checked (free metadata) BEFORE any billed fetch; a ``start`` earlier than
+        the schema's availability raises ``DataNotAvailableError`` (``cbbo-1m`` back to 2013,
+        ``cbbo-1s`` only 2025-02-20). When ``max_cost_usd`` is given, the query is cost-quoted
+        (free) BEFORE billing and a ``CostLimitError`` is raised if the estimate exceeds the cap.
+        The cost guard fails CLOSED: if the free cost-metadata call cannot return an estimate
+        (e.g. a transient gateway timeout, which surfaces as a non-positive estimate), a
+        ``NetworkError`` is raised rather than proceeding to an unguarded billed pull.
+
+        This is a non-OHLCV frame: it deliberately bypasses ``_transform_data`` /
+        ``_validate_ohlcv`` (which are OHLCV-only).
+
+        SPX dual-root: SPX index options have TWO roots (``SPX`` AM-settled monthlies and
+        ``SPXW`` PM-settled weeklys / EOM) — call once per root for full coverage.
+
+        Args:
+            underlying: Underlying root, e.g. "SPX" or "SPXW". No ".OPT" suffix — the parent
+                symbol is built internally.
+            start: Start bound — ISO-8601 date (whole-day) or datetime (intraday window),
+                inclusive.
+            end: End bound, same ISO date-or-datetime form as ``start``.
+            schema: Consolidated-quote schema ("cbbo-1m" default; also "cbbo-1s"/"tcbbo"/"cmbp-1").
+            max_cost_usd: Optional hard cost ceiling in USD. When set, the query is cost-quoted
+                before billing and ``CostLimitError`` is raised if the estimate exceeds it.
+                ``None`` (default) skips the guard.
+
+        Returns:
+            An ``OptionChainQuoteSchema`` frame [timestamp, instrument_id, raw_symbol, bid_px_00,
+            ask_px_00, spread, bid_sz_00, ask_sz_00], one row per (contract, sampled timestamp),
+            sorted ascending by the sampling clock. A well-formed empty frame when no quotes are
+            available for the chain/window. ``AuthenticationError``/``RateLimitError`` and the
+            availability/cost ``DataNotAvailableError``/``CostLimitError`` propagate (they are not
+            "no data"). NOTE: a client-side error from the billed fetch (a malformed root or an
+            invalid schema) degrades to an empty frame — double-check ``underlying``/``schema``
+            when a populated window comes back empty.
+
+        Raises:
+            DataNotAvailableError: If ``schema`` is not available on OPRA as early as ``start``.
+            CostLimitError: If ``max_cost_usd`` is set and the estimate exceeds it.
+            NetworkError: If ``max_cost_usd`` is set but the cost estimate cannot be obtained
+                (the guard fails closed rather than billing an unverified pull).
+        """
+        parent = f"{underlying}.OPT"
+        self.logger.info(
+            "Fetching option chain quotes",
+            underlying=underlying,
+            parent=parent,
+            start=start,
+            end=end,
+            schema=schema,
+            max_cost_usd=max_cost_usd,
+            provider=self.name,
+        )
+        self._validate_inputs(parent, start, end, schema)
+
+        # Availability gate BEFORE any billed fetch (free metadata). Lexicographic comparison is
+        # chronological for ISO start strings (the date prefix dominates). avail is None
+        # (unknown/lookup failed) fails OPEN: proceed to the billed fetch.
+        avail = self._schema_available_from(schema, dataset=OPRA_DATASET)
+        if avail and start < avail:
+            raise DataNotAvailableError(
+                self.name,
+                f"{schema} is available on OPRA from {avail}; start {start} is too early "
+                f"(availability is per-schema: cbbo-1m back to 2013, cbbo-1s only 2025-02-20).",
+            )
+
+        # Cost guard BEFORE any billed fetch (free metadata). Whole-chain quotes are the
+        # documented cost trap; max_cost_usd is the opt-in rail. None -> no quote, no guard.
+        if max_cost_usd is not None:
+            estimated = self.get_cost_quote(
+                symbols=parent,
+                schema=schema,
+                start=start,
+                end=end,
+                stype_in="parent",
+                dataset=OPRA_DATASET,
+            )
+            # get_cost_quote returns 0.0 when the free metadata call fails (e.g. a 504 gateway
+            # timeout) — indistinguishable from a genuine $0. A whole-chain cbbo pull is never
+            # genuinely $0, so a non-positive estimate means the cost could NOT be verified. The
+            # caller set max_cost_usd precisely to avoid a surprise bill, so fail CLOSED rather
+            # than fall through to an unguarded billed pull (failing open is the expensive
+            # direction). Callers who do not want this can omit max_cost_usd (opt out of the rail).
+            # Note this intentionally treats a legitimate $0 estimate (if Databento ever priced a
+            # query at zero) as "unverified" too — an accepted false positive, since a whole-chain
+            # cbbo quote is never genuinely free and conflating the two is the safe direction.
+            if estimated <= 0.0:
+                self.logger.warning(
+                    "Cost estimate unavailable; refusing billed fetch under max_cost_usd",
+                    parent=parent,
+                    schema=schema,
+                    max_cost_usd=max_cost_usd,
+                    provider=self.name,
+                )
+                raise NetworkError(
+                    provider=self.name,
+                    message=(
+                        f"could not verify query cost against max_cost_usd=${max_cost_usd:.2f} "
+                        "(the free cost-metadata call returned no estimate); refusing the billed "
+                        "fetch. Retry, or omit max_cost_usd to bypass the cost guard."
+                    ),
+                )
+            if estimated > max_cost_usd:
+                raise CostLimitError(self.name, estimated, max_cost_usd)
+
+        self._acquire_rate_limit()
+
+        def _fetch_and_process() -> pl.DataFrame:
+            try:
+                raw = self._fetch_raw_data(
+                    parent,
+                    start,
+                    end,
+                    dataset=OPRA_DATASET,
+                    stype_in="parent",
+                    schema=schema,
+                )
+            except DataNotAvailableError:
+                # No quotes for this chain/window -> well-formed empty frame.
+                # (Auth/rate-limit errors are NOT swallowed; they propagate to the caller.)
+                return OptionChainQuoteSchema.create_empty()
+
+            q = self._response_to_frame(raw)
+            if q.is_empty():
+                return OptionChainQuoteSchema.create_empty()
+
+            # Resolve OSI raw_symbol via a definition join (cbbo records carry only
+            # instrument_id). Pull definitions over the calendar DAY(S) of the window, not the
+            # intraday window itself: OPRA emits definition records once at session start
+            # (~00:00 UTC), so a late-day window like 19:50-20:10 returns zero definitions. The
+            # id->raw_symbol mapping is stable within the day (TASK-004), so the same-day chain
+            # is the correct, free (schema="definition") source. start/end are ISO strings, so
+            # the date prefix is the first 10 chars (YYYY-MM-DD) for both date and datetime forms.
+            chain = self.fetch_option_chain(underlying, start[:10], end[:10])
+            return self._shape_chain_quotes(q, chain)
+
+        return self._with_circuit_breaker(_fetch_and_process)
+
+    def _shape_chain_quotes(self, df: pl.DataFrame, chain: pl.DataFrame) -> pl.DataFrame:
+        """Shape a raw parent consolidated-quote frame into the OptionChainQuoteSchema.
+
+        Like ``_shape_option_quotes`` (spread guard, ts_recv/ts_event clock, UTC microsecond
+        normalization), but carries a per-contract identity: ``instrument_id`` (native to the
+        ``cbbo`` response) plus the OSI ``raw_symbol`` resolved by a left-join against the
+        definition ``chain`` on ``instrument_id``. Rows are NOT deduped across ``instrument_id``
+        — the parent pull interleaves many contracts and each is a distinct row.
+        """
+        # Spread guard: only compute when BOTH price columns are present (sparse-schema safe).
+        if "bid_px_00" in df.columns and "ask_px_00" in df.columns:
+            df = df.with_columns((pl.col("ask_px_00") - pl.col("bid_px_00")).alias("spread"))
+
+        # Sampling clock is ts_recv; ts_event is the last book-change time (can stale/repeat).
+        clock = "ts_recv" if "ts_recv" in df.columns else "ts_event"
+        if clock not in df.columns:
+            raise ValueError(
+                "consolidated quote response carried neither a ts_recv nor ts_event timestamp "
+                "column; cannot build an OptionChainQuoteSchema frame."
+            )
+        df = df.sort(clock).rename({clock: "timestamp"})
+
+        df = DataBentoProvider._coerce_epoch_datetime(df, "timestamp", label="option chain quotes")
+        df = DataBentoProvider._to_utc(df, "timestamp", unit="us")
+
+        # Resolve raw_symbol by a left-join on instrument_id (TASK-004 decision: definition join,
+        # not map_symbols — a parent pull resolves map_symbols to the useless parent string). An
+        # empty/partial chain leaves raw_symbol null; a row without a definition match keeps its
+        # instrument_id (do not drop it). Back-fill a typed-null raw_symbol if either side lacks
+        # the join key so the conform step below always produces the column.
+        if "instrument_id" in df.columns and {"instrument_id", "raw_symbol"} <= set(chain.columns):
+            # Cast the join key to Int64 on BOTH sides so the join never relies on Polars
+            # coercing mismatched integer dtypes (a cbbo response carries instrument_id as
+            # uint32, while the definition chain's key is Int64 per OptionChainSchema) — that
+            # coercion is version-dependent and stricter Polars raises a join-key schema error.
+            df = df.with_columns(pl.col("instrument_id").cast(pl.Int64))
+            id_map = (
+                chain.select(["instrument_id", "raw_symbol"])
+                .with_columns(pl.col("instrument_id").cast(pl.Int64))
+                .unique(subset=["instrument_id"])
+            )
+            df = df.join(id_map, on="instrument_id", how="left")
+        elif "raw_symbol" not in df.columns:
+            df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("raw_symbol"))
+
+        # Conform to OptionChainQuoteSchema: cast present columns, back-fill missing with typed
+        # nulls, then select in schema order.
+        schema = OptionChainQuoteSchema.SCHEMA
         df = df.with_columns([pl.col(c).cast(dt) for c, dt in schema.items() if c in df.columns])
         fills = [pl.lit(None, dtype=dt).alias(c) for c, dt in schema.items() if c not in df.columns]
         if fills:

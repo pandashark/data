@@ -6,6 +6,7 @@ tests run in the default lane with a mocked ``Historical`` client (no network).
 
 import builtins
 import importlib
+import os
 import sys
 from datetime import UTC, date, datetime
 from unittest.mock import Mock, patch
@@ -15,8 +16,17 @@ import polars as pl
 import pytest
 from databento.common.error import BentoClientError
 
-from ml4t.data.core.exceptions import AuthenticationError, DataNotAvailableError
-from ml4t.data.core.schemas import OptionChainSchema, OptionQuoteSchema
+from ml4t.data.core.exceptions import (
+    AuthenticationError,
+    CostLimitError,
+    DataNotAvailableError,
+    NetworkError,
+)
+from ml4t.data.core.schemas import (
+    OptionChainQuoteSchema,
+    OptionChainSchema,
+    OptionQuoteSchema,
+)
 from ml4t.data.providers.databento import (
     OPRA_DATASET,
     DataBentoProvider,
@@ -1170,6 +1180,406 @@ class TestFetchOptionQuotes:
         )
         with pytest.raises(AuthenticationError):
             provider.fetch_option_quotes(self.CONTRACT, "2025-03-03", "2025-03-04")
+
+
+class TestFetchOptionChainQuotes:
+    """Targeted regressions for fetch_option_chain_quotes (the broad suite is TASK-006)."""
+
+    @pytest.fixture
+    def provider(self):
+        """Provider with a mocked Historical client; availability resolved for cbbo-1m."""
+        with patch("ml4t.data.providers.databento.Historical") as mock_historical:
+            mock_client = Mock()
+            mock_historical.return_value = mock_client
+            provider = DataBentoProvider(api_key="test_key")
+            provider.client = mock_client
+            provider.client.metadata.get_dataset_range.return_value = {
+                "schema": {"cbbo-1m": {"start": "2013-07-15T00:00:00Z"}}
+            }
+            return provider
+
+    @staticmethod
+    def _parent_cbbo_response():
+        """A parent cbbo response: many contracts interleaved, instrument_id as uint32.
+
+        A real cbbo response carries instrument_id as uint32 (the CBBOMsg struct field). The
+        definition chain's key is Int64, so the shaper must reconcile the dtypes before the join.
+        """
+        idx = pd.DatetimeIndex([datetime(2025, 3, 3, 19, 50)] * 3, name="ts_recv")
+        frame = pd.DataFrame(
+            {
+                "instrument_id": [111, 222, 999],
+                "bid_px_00": [1.0, 2.0, 3.0],
+                "ask_px_00": [1.5, 2.5, 3.5],
+                "bid_sz_00": [10, 20, 30],
+                "ask_sz_00": [11, 21, 31],
+                "publisher_id": [30, 30, 30],
+            },
+            index=idx,
+        )
+        # cbbo carries instrument_id as uint32; cast AFTER construction so the column keeps its
+        # positional values (a pd.Series with its own index would align to the DatetimeIndex -> NaN).
+        frame["instrument_id"] = frame["instrument_id"].astype("uint32")
+        resp = Mock()
+        resp.to_df.return_value = frame
+        return resp
+
+    @staticmethod
+    def _definition_response():
+        """A definition response (Int64 instrument_id) covering two of the three contracts."""
+        idx = pd.DatetimeIndex([datetime(2025, 3, 3), datetime(2025, 3, 3)], name="ts_recv")
+        frame = pd.DataFrame(
+            {
+                "raw_symbol": ["SPX   250321C05800000", "SPX   250321P05800000"],
+                "instrument_class": ["C", "P"],
+                "strike_price": [5800.0, 5800.0],
+                "expiration": [pd.Timestamp("2025-03-21"), pd.Timestamp("2025-03-21")],
+                "instrument_id": [111, 222],
+                "rtype": [19, 19],
+                "publisher_id": [1, 1],
+            },
+            index=idx,
+        )
+        resp = Mock()
+        resp.to_df.return_value = frame
+        return resp
+
+    def test_cost_guard_fails_closed_when_estimate_unavailable(self, provider):
+        """If the free cost-metadata call fails (get_cost_quote -> 0.0), the guard fails CLOSED:
+        raise NetworkError and never reach the billed fetch."""
+        # Simulate a 504 on the metadata call -> get_cost_quote swallows it to 0.0.
+        provider.client.metadata.get_cost.side_effect = Exception("504 gateway timeout")
+
+        with pytest.raises(NetworkError, match="could not verify query cost"):
+            provider.fetch_option_chain_quotes(
+                "SPX", "2025-03-03T19:50", "2025-03-03T20:10", max_cost_usd=0.25
+            )
+        # No billed fetch happened.
+        provider.client.timeseries.get_range.assert_not_called()
+
+    def test_cost_guard_absent_does_not_quote_or_block(self, provider):
+        """With max_cost_usd unset, no cost quote is taken and the pull proceeds."""
+        provider.client.timeseries.get_range.side_effect = [
+            self._parent_cbbo_response(),
+            self._definition_response(),
+        ]
+        result = provider.fetch_option_chain_quotes("SPX", "2025-03-03T19:50", "2025-03-03T20:10")
+        provider.client.metadata.get_cost.assert_not_called()
+        assert not result.is_empty()
+
+    def test_raw_symbol_resolved_across_mismatched_id_dtypes(self, provider):
+        """The definition join resolves raw_symbol even though cbbo instrument_id is uint32 and
+        the chain key is Int64; an unmatched id keeps its row with a null raw_symbol (D2)."""
+        provider.client.timeseries.get_range.side_effect = [
+            self._parent_cbbo_response(),
+            self._definition_response(),
+        ]
+        result = provider.fetch_option_chain_quotes("SPX", "2025-03-03T19:50", "2025-03-03T20:10")
+
+        assert OptionChainQuoteSchema.validate(result) is True
+        assert result.schema["instrument_id"] == pl.Int64
+        by_id = {row["instrument_id"]: row["raw_symbol"] for row in result.iter_rows(named=True)}
+        assert by_id[111] == "SPX   250321C05800000"
+        assert by_id[222] == "SPX   250321P05800000"
+        # The third contract has no definition match -> identifiable by id, raw_symbol null.
+        assert by_id[999] is None
+        # Rows are NOT deduped across contracts.
+        assert result.height == 3
+
+    @staticmethod
+    def _empty_cbbo_response():
+        """An empty parent cbbo response (no rows)."""
+        resp = Mock()
+        resp.to_df.return_value = pd.DataFrame(
+            {
+                "ts_recv": [],
+                "instrument_id": [],
+                "bid_px_00": [],
+                "ask_px_00": [],
+                "bid_sz_00": [],
+                "ask_sz_00": [],
+            }
+        )
+        return resp
+
+    def test_shape_conforms_and_computes_spread(self, provider):
+        """The shaped frame conforms to OptionChainQuoteSchema, carries both id columns, and
+        computes spread = ask - bid; the call issues exactly two get_range pulls (cbbo + def)."""
+        provider.client.timeseries.get_range.side_effect = [
+            self._parent_cbbo_response(),
+            self._definition_response(),
+        ]
+        result = provider.fetch_option_chain_quotes("SPX", "2025-03-03T19:50", "2025-03-03T20:10")
+
+        assert result.columns == list(OptionChainQuoteSchema.SCHEMA.keys())
+        assert OptionChainQuoteSchema.validate(result) is True
+        assert result.schema["instrument_id"] == pl.Int64
+        assert result.schema["raw_symbol"] == pl.Utf8
+        # bid/ask were [1.0,2.0,3.0]/[1.5,2.5,3.5] -> every spread is 0.5.
+        assert result["spread"].to_list() == [0.5, 0.5, 0.5]
+        assert provider.client.timeseries.get_range.call_count == 2
+
+    def test_empty_response_returns_empty_chain_quote_frame(self, provider):
+        """An empty cbbo response yields a well-formed empty frame BEFORE any definition pull."""
+        provider.client.timeseries.get_range.return_value = self._empty_cbbo_response()
+
+        result = provider.fetch_option_chain_quotes("SPX", "2025-03-03T19:50", "2025-03-03T20:10")
+
+        assert result.is_empty()
+        assert result.columns == list(OptionChainQuoteSchema.SCHEMA.keys())
+        assert OptionChainQuoteSchema.validate(result) is True
+        # No definition pull fires once the cbbo frame is empty (early return).
+        assert provider.client.timeseries.get_range.call_count == 1
+
+    def test_cost_over_cap_raises_and_skips_fetch(self, provider):
+        """An estimate above max_cost_usd raises CostLimitError and never bills a fetch."""
+        provider.client.metadata.get_cost.return_value = 5.0
+
+        with pytest.raises(CostLimitError, match="exceeds limit"):
+            provider.fetch_option_chain_quotes(
+                "SPX", "2025-03-03T19:50", "2025-03-03T20:10", max_cost_usd=0.25
+            )
+        provider.client.timeseries.get_range.assert_not_called()
+        # The guard cost-quotes the parent symbol (free metadata), never billable_size.
+        assert provider.client.metadata.get_cost.call_args.kwargs["stype_in"] == "parent"
+        provider.client.metadata.get_billable_size.assert_not_called()
+
+    def test_cost_under_cap_proceeds_to_fetch(self, provider):
+        """An estimate at or below max_cost_usd proceeds to the billed fetch."""
+        provider.client.metadata.get_cost.return_value = 0.05
+        provider.client.timeseries.get_range.side_effect = [
+            self._parent_cbbo_response(),
+            self._definition_response(),
+        ]
+        result = provider.fetch_option_chain_quotes(
+            "SPX", "2025-03-03T19:50", "2025-03-03T20:10", max_cost_usd=0.25
+        )
+        provider.client.metadata.get_cost.assert_called_once()
+        assert not result.is_empty()
+        assert provider.client.timeseries.get_range.call_count == 2
+
+    def test_availability_too_early_raises_and_skips_fetch(self, provider):
+        """A start before the schema's availability raises DataNotAvailableError before billing."""
+        provider.client.metadata.get_dataset_range.return_value = {
+            "schema": {"cbbo-1s": {"start": "2025-02-20T00:00:00Z"}}
+        }
+        with pytest.raises(DataNotAvailableError, match="cbbo-1s"):
+            provider.fetch_option_chain_quotes(
+                "SPX", "2025-01-01T19:50", "2025-01-01T20:10", schema="cbbo-1s"
+            )
+        provider.client.timeseries.get_range.assert_not_called()
+
+    def test_intraday_window_reaches_sdk_unfloored(self, provider):
+        """An ISO datetime window flows to the SDK with its HH:MM intact (TASK-001 plumbing)."""
+        provider.client.timeseries.get_range.side_effect = [
+            self._parent_cbbo_response(),
+            self._definition_response(),
+        ]
+        provider.fetch_option_chain_quotes("SPX", "2025-03-03T19:50:00", "2025-03-03T20:10:00")
+
+        cbbo_call = provider.client.timeseries.get_range.call_args_list[0].kwargs
+        assert (cbbo_call["start"].hour, cbbo_call["start"].minute) == (19, 50)
+        assert (cbbo_call["end"].hour, cbbo_call["end"].minute) == (20, 10)
+
+    def test_date_only_bounds_floor_and_ceil(self, provider):
+        """Date-only bounds keep the whole-day window: start floors to 00:00, end ceils to 23:59."""
+        provider.client.timeseries.get_range.side_effect = [
+            self._parent_cbbo_response(),
+            self._definition_response(),
+        ]
+        provider.fetch_option_chain_quotes("SPX", "2025-03-03", "2025-03-04")
+
+        cbbo_call = provider.client.timeseries.get_range.call_args_list[0].kwargs
+        assert (cbbo_call["start"].hour, cbbo_call["start"].minute) == (0, 0)
+        assert (cbbo_call["end"].hour, cbbo_call["end"].minute, cbbo_call["end"].second) == (
+            23,
+            59,
+            59,
+        )
+
+    def test_windowed_billable_forwards_distinct_window_and_day_bounds(self, provider):
+        """The free billable-size estimate forwards the intraday window and the full-day bounds
+        to the SDK as given (the cost lever is the narrower window; the actual window<day byte
+        comparison is asserted live in the @integration tier, not against a dictated mock)."""
+        provider.client.metadata.get_billable_size.return_value = 120
+        for start, end in (
+            ("2025-03-03T19:50:00", "2025-03-03T20:10:00"),
+            ("2025-03-03", "2025-03-04"),
+        ):
+            provider.get_billable_size(
+                symbols="SPX.OPT",
+                schema="cbbo-1m",
+                start=start,
+                end=end,
+                stype_in="parent",
+                dataset=OPRA_DATASET,
+            )
+        calls = provider.client.metadata.get_billable_size.call_args_list
+        assert len(calls) == 2
+        # Window bounds carry the intraday time; the full-day bounds are date-only — the helper
+        # forwards both verbatim with the parent stype and OPRA dataset.
+        assert (calls[0].kwargs["start"], calls[0].kwargs["end"]) == (
+            "2025-03-03T19:50:00",
+            "2025-03-03T20:10:00",
+        )
+        assert (calls[1].kwargs["start"], calls[1].kwargs["end"]) == ("2025-03-03", "2025-03-04")
+        for call in calls:
+            assert call.kwargs["stype_in"] == "parent"
+            assert call.kwargs["dataset"] == OPRA_DATASET
+
+    def test_definition_join_call_shape_and_no_mutation(self, provider):
+        """Both pulls target OPRA with stype_in='parent'; the second is the definition pull;
+        self.dataset is never mutated (R2)."""
+        provider.client.timeseries.get_range.side_effect = [
+            self._parent_cbbo_response(),
+            self._definition_response(),
+        ]
+        provider.fetch_option_chain_quotes("SPX", "2025-03-03T19:50", "2025-03-03T20:10")
+
+        calls = provider.client.timeseries.get_range.call_args_list
+        assert len(calls) == 2
+        cbbo, definition = calls[0].kwargs, calls[1].kwargs
+        assert cbbo["dataset"] == OPRA_DATASET
+        assert cbbo["stype_in"] == "parent"
+        assert cbbo["schema"] == "cbbo-1m"
+        assert cbbo["symbols"] == ["SPX.OPT"]
+        assert definition["dataset"] == OPRA_DATASET
+        assert definition["stype_in"] == "parent"
+        assert definition["schema"] == "definition"
+        assert definition["symbols"] == ["SPX.OPT"]
+        # R2: the OPRA dataset is passed per call; the instance default is untouched.
+        assert provider.dataset == "GLBX.MDP3"
+
+    def test_custom_schema_passed_through(self, provider):
+        """A non-default quote schema reaches the cbbo pull; the definition pull stays definition."""
+        provider.client.timeseries.get_range.side_effect = [
+            self._parent_cbbo_response(),
+            self._definition_response(),
+        ]
+        provider.fetch_option_chain_quotes(
+            "SPX", "2025-03-03T19:50", "2025-03-03T20:10", schema="tcbbo"
+        )
+        calls = provider.client.timeseries.get_range.call_args_list
+        assert calls[0].kwargs["schema"] == "tcbbo"
+        assert calls[1].kwargs["schema"] == "definition"
+
+    def test_no_data_error_returns_empty_chain_quote_frame(self, provider):
+        """A no-data BentoClientError degrades to an empty frame (not a raise)."""
+        provider.client.timeseries.get_range.side_effect = BentoClientError("no data found")
+
+        result = provider.fetch_option_chain_quotes("SPX", "2025-03-03T19:50", "2025-03-03T20:10")
+        assert result.is_empty()
+        assert result.columns == list(OptionChainQuoteSchema.SCHEMA.keys())
+
+    def test_auth_error_propagates(self, provider):
+        """An auth error is not "no data" — it propagates."""
+        provider.client.timeseries.get_range.side_effect = BentoClientError(
+            "Unauthorized: Invalid API key"
+        )
+        with pytest.raises(AuthenticationError):
+            provider.fetch_option_chain_quotes("SPX", "2025-03-03T19:50", "2025-03-03T20:10")
+
+    def test_bypasses_validate_ohlcv(self, provider):
+        """R1: never routes through _validate_ohlcv; OHLCV columns are absent."""
+        provider.client.timeseries.get_range.side_effect = [
+            self._parent_cbbo_response(),
+            self._definition_response(),
+        ]
+        with patch.object(provider, "_validate_ohlcv") as mock_validate:
+            result = provider.fetch_option_chain_quotes(
+                "SPX", "2025-03-03T19:50", "2025-03-03T20:10"
+            )
+        mock_validate.assert_not_called()
+        assert "bid_px_00" in result.columns
+        assert "spread" in result.columns
+        assert "open" not in result.columns
+        assert "close" not in result.columns
+
+
+_DATABENTO_API_KEY = os.getenv("DATABENTO_API_KEY")
+
+
+@pytest.mark.skipif(
+    not _DATABENTO_API_KEY,
+    reason="DATABENTO_API_KEY not set - get key at https://databento.com/",
+)
+@pytest.mark.integration
+class TestFetchOptionChainQuotesFreeMetadata:
+    """Gated, deselected-by-default LIVE tier — FREE metadata only (never bills).
+
+    Deselected by the default ``-m "not integration ..."`` lane; run with ``-m integration``.
+    Asserts strictly-positive values because the helpers degrade to a 0/0.0 sentinel on error,
+    so ``>= 0`` would mask a silently-failed call. NEVER calls fetch_option_chain_quotes here.
+    """
+
+    @pytest.fixture
+    def provider(self):
+        return DataBentoProvider(api_key=_DATABENTO_API_KEY)
+
+    def test_parent_cost_quote_is_positive(self, provider):
+        cost = provider.get_cost_quote(
+            symbols="SPX.OPT",
+            schema="cbbo-1m",
+            start="2024-05-15T19:50:00",
+            end="2024-05-15T20:10:00",
+            stype_in="parent",
+            dataset=OPRA_DATASET,
+        )
+        assert cost > 0.0
+
+    def test_windowed_bills_fewer_bytes_than_full_day(self, provider):
+        window = provider.get_billable_size(
+            symbols="SPX.OPT",
+            schema="cbbo-1m",
+            start="2024-05-15T19:50:00",
+            end="2024-05-15T20:10:00",
+            stype_in="parent",
+            dataset=OPRA_DATASET,
+        )
+        day = provider.get_billable_size(
+            symbols="SPX.OPT",
+            schema="cbbo-1m",
+            start="2024-05-15",
+            end="2024-05-16",
+            stype_in="parent",
+            dataset=OPRA_DATASET,
+        )
+        assert 0 < window < day
+
+    def test_cbbo_1m_available_in_deep_history(self, provider):
+        avail = provider._schema_available_from("cbbo-1m", dataset=OPRA_DATASET)
+        assert avail is not None
+        assert avail <= "2014-01-01"
+
+
+@pytest.mark.skipif(
+    not _DATABENTO_API_KEY,
+    reason="DATABENTO_API_KEY not set - get key at https://databento.com/",
+)
+@pytest.mark.integration
+@pytest.mark.paid_tier
+class TestFetchOptionChainQuotesPaid:
+    """Gated, deselected-by-default LIVE tier — BILLED. Run with ``-m paid_tier``.
+
+    A tiny 1-minute windowed whole-chain pull, capped with a max_cost_usd guard to bound spend.
+    """
+
+    @pytest.fixture
+    def provider(self):
+        return DataBentoProvider(api_key=_DATABENTO_API_KEY)
+
+    def test_tiny_windowed_chain_pull(self, provider):
+        df = provider.fetch_option_chain_quotes(
+            "SPX",
+            "2024-05-15T19:59:00",
+            "2024-05-15T20:00:00",
+            max_cost_usd=2.0,
+        )
+        assert df.columns == list(OptionChainQuoteSchema.SCHEMA.keys())
+        assert OptionChainQuoteSchema.validate(df) is True
+        if not df.is_empty():
+            # A parent pull interleaves many distinct contracts.
+            assert df["instrument_id"].n_unique() > 1
 
 
 class TestCoerceEpochDatetime:

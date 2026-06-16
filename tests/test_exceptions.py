@@ -107,6 +107,21 @@ class TestCoreExceptions:
         assert exc.provider == "yahoo"
         assert "No data available" in str(exc)
 
+    def test_cost_limit_error(self):
+        """Test CostLimitError functionality."""
+        from ml4t.data.core.exceptions import CostLimitError, ProviderError
+
+        exc = CostLimitError("databento", 12.5, 5.0)
+        assert isinstance(exc, ProviderError)
+        assert exc.provider == "databento"
+        assert exc.estimated_cost == 12.5
+        assert exc.max_cost == 5.0
+        # Provider prefix + both costs rendered in the message.
+        assert str(exc) == "databento: Estimated cost $12.50 exceeds limit $5.00"
+        # Structured values land in details.
+        assert exc.details["estimated_cost"] == 12.5
+        assert exc.details["max_cost"] == 5.0
+
     def test_lock_error(self):
         """Test LockError functionality."""
         from ml4t.data.core.exceptions import LockError

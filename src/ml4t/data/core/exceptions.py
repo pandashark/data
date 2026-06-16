@@ -210,6 +210,40 @@ class DataNotAvailableError(ProviderError):
         self.frequency = frequency
 
 
+class CostLimitError(ProviderError):
+    """Estimated query cost exceeds the caller-supplied limit."""
+
+    def __init__(
+        self,
+        provider: str,
+        estimated_cost: float,
+        max_cost: float,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """
+        Initialize cost limit error.
+
+        Args:
+            provider: Provider name
+            estimated_cost: Estimated query cost in USD
+            max_cost: Maximum allowed cost in USD
+            details: Optional error details
+        """
+        message = f"Estimated cost ${estimated_cost:.2f} exceeds limit ${max_cost:.2f}"
+        if details is None:
+            details = {}
+        details.update(
+            {
+                "estimated_cost": estimated_cost,
+                "max_cost": max_cost,
+            }
+        )
+
+        super().__init__(provider, message, details)
+        self.estimated_cost = estimated_cost
+        self.max_cost = max_cost
+
+
 class StorageError(ML4TDataError):
     """Storage-related errors."""
 

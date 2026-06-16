@@ -7,6 +7,7 @@ import pytest
 
 from ml4t.data.core.schemas import (
     MultiAssetSchema,
+    OptionChainQuoteSchema,
     OptionChainSchema,
     OptionQuoteSchema,
     align_frames_for_concat,
@@ -898,3 +899,118 @@ class TestOptionQuoteSchema:
         df = OptionQuoteSchema.create_empty()
         assert df.height == 0
         assert set(df.columns) == set(OptionQuoteSchema.SCHEMA.keys())
+
+
+class TestOptionChainQuoteSchema:
+    """Validation and creation for the whole-chain consolidated-quote schema."""
+
+    @pytest.fixture
+    def valid_chain_quote_df(self):
+        """A 2-row frame conforming to OptionChainQuoteSchema."""
+        return pl.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2024, 1, 5, 14, 30, tzinfo=UTC),
+                    datetime(2024, 1, 5, 14, 31, tzinfo=UTC),
+                ],
+                "instrument_id": [1001, 1002],
+                "raw_symbol": ["SPXW  240105C04800000", "SPXW  240105P04800000"],
+                "bid_px_00": [1.25, 2.50],
+                "ask_px_00": [1.35, 2.65],
+                "spread": [0.10, 0.15],
+                "bid_sz_00": [10, 20],
+                "ask_sz_00": [12, 22],
+            }
+        )
+
+    def test_schema_has_required_columns(self):
+        """SCHEMA pins exactly the eight expected columns."""
+        assert set(OptionChainQuoteSchema.SCHEMA.keys()) == {
+            "timestamp",
+            "instrument_id",
+            "raw_symbol",
+            "bid_px_00",
+            "ask_px_00",
+            "spread",
+            "bid_sz_00",
+            "ask_sz_00",
+        }
+
+    def test_schema_data_types(self):
+        """Each column dtype is pinned as documented."""
+        s = OptionChainQuoteSchema.SCHEMA
+        assert s["timestamp"] == pl.Datetime("us", "UTC")
+        assert s["instrument_id"] == pl.Int64
+        assert s["raw_symbol"] == pl.Utf8
+        assert s["bid_px_00"] == pl.Float64
+        assert s["ask_px_00"] == pl.Float64
+        assert s["spread"] == pl.Float64
+        assert s["bid_sz_00"] == pl.Int64
+        assert s["ask_sz_00"] == pl.Int64
+
+    def test_validate_valid_dataframe(self, valid_chain_quote_df):
+        """A conforming frame validates."""
+        assert OptionChainQuoteSchema.validate(valid_chain_quote_df) is True
+
+    def test_validate_missing_column_strict(self, valid_chain_quote_df):
+        """A missing column raises in strict mode, naming the column."""
+        df = valid_chain_quote_df.drop("spread")
+        with pytest.raises(ValueError, match="Missing required column: spread"):
+            OptionChainQuoteSchema.validate(df, strict=True)
+
+    def test_validate_missing_column_non_strict(self, valid_chain_quote_df):
+        """A missing column returns False in non-strict mode."""
+        df = valid_chain_quote_df.drop("instrument_id")
+        assert OptionChainQuoteSchema.validate(df, strict=False) is False
+
+    def test_validate_timestamp_precision_agnostic(self, valid_chain_quote_df):
+        """timestamp is accepted at any datetime precision."""
+        df_ns = valid_chain_quote_df.with_columns(
+            pl.col("timestamp").cast(pl.Datetime("ns", "UTC"))
+        )
+        assert OptionChainQuoteSchema.validate(df_ns) is True
+
+    def test_validate_float_sizes_accepted(self, valid_chain_quote_df):
+        """Float-typed sizes pass the numeric compatibility check."""
+        df_float = valid_chain_quote_df.with_columns(
+            pl.col("bid_sz_00").cast(pl.Float64),
+            pl.col("ask_sz_00").cast(pl.Float64),
+        )
+        assert OptionChainQuoteSchema.validate(df_float) is True
+
+    def test_validate_wrong_price_type_strict(self, valid_chain_quote_df):
+        """Non-numeric price raises in strict mode."""
+        df_wrong = valid_chain_quote_df.with_columns(pl.col("bid_px_00").cast(pl.Utf8))
+        with pytest.raises(ValueError, match="Column 'bid_px_00' must be numeric"):
+            OptionChainQuoteSchema.validate(df_wrong, strict=True)
+
+    def test_validate_wrong_raw_symbol_type_strict(self, valid_chain_quote_df):
+        """A non-string raw_symbol raises in strict mode."""
+        # Replace the OSI strings with an Int64 column (a direct cast would fail at the
+        # cast step, before validate runs).
+        df_wrong = valid_chain_quote_df.with_columns(
+            pl.Series("raw_symbol", [1001, 1002], dtype=pl.Int64)
+        )
+        with pytest.raises(ValueError, match="Column 'raw_symbol' must be string type"):
+            OptionChainQuoteSchema.validate(df_wrong, strict=True)
+
+    def test_validate_categorical_raw_symbol_accepted(self, valid_chain_quote_df):
+        """A Categorical raw_symbol is accepted as a string type."""
+        df_cat = valid_chain_quote_df.with_columns(pl.col("raw_symbol").cast(pl.Categorical))
+        assert OptionChainQuoteSchema.validate(df_cat) is True
+
+    def test_validate_null_raw_symbol_accepted(self, valid_chain_quote_df):
+        """An unresolved (all-null) but Utf8-typed raw_symbol still validates (D2)."""
+        df_null = valid_chain_quote_df.with_columns(pl.lit(None, dtype=pl.Utf8).alias("raw_symbol"))
+        assert df_null["raw_symbol"].dtype == pl.Utf8
+        assert OptionChainQuoteSchema.validate(df_null) is True
+
+    def test_create_empty(self):
+        """create_empty yields a 0-row frame with all schema columns."""
+        df = OptionChainQuoteSchema.create_empty()
+        assert df.height == 0
+        assert set(df.columns) == set(OptionChainQuoteSchema.SCHEMA.keys())
+
+    def test_create_empty_dtypes(self):
+        """create_empty's dtypes match SCHEMA exactly."""
+        assert dict(OptionChainQuoteSchema.create_empty().schema) == OptionChainQuoteSchema.SCHEMA
