@@ -13,7 +13,7 @@ This provider supports:
 from __future__ import annotations
 
 import os
-from datetime import UTC, date, datetime
+from datetime import date
 from typing import Any, ClassVar
 
 import polars as pl
@@ -282,8 +282,8 @@ class DataBentoProvider(BaseProvider):
         # whole-day window (start floored to 00:00:00, end ceiled to 23:59:59 UTC); an explicit
         # time component is honored verbatim so callers can request an intraday window (e.g. the
         # ~20-min cbbo-1m snapshot around the cash close) instead of a full session day.
-        start_dt = self._resolve_request_bound(start, is_end=False)
-        end_dt = self._resolve_request_bound(end, is_end=True)
+        start_dt = self._parse_iso_bound(start, is_end=False)
+        end_dt = self._parse_iso_bound(end, is_end=True)
 
         # Adjust for session dates if enabled (for futures with CME session logic)
         # The CME maintenance-break shift is futures-only; never apply it to OPRA option calls.
@@ -336,29 +336,6 @@ class DataBentoProvider(BaseProvider):
                 provider=self.name,
                 message=f"Failed to fetch data from Databento: {e}",
             )
-
-    @staticmethod
-    def _resolve_request_bound(value: str, *, is_end: bool) -> datetime:
-        """Parse an ISO-8601 date or datetime into a UTC request bound.
-
-        A date-only string (no ``T``/space time separator) keeps the historical whole-day
-        window: the start bound floors to ``00:00:00`` and the end bound ceils to ``23:59:59``.
-        An explicit time component is honored verbatim — a naive value is treated as UTC, a
-        tz-aware value (``Z``/offset) is converted to UTC — so a caller can request an intraday
-        window instead of a full session day. A bare date and an explicit midnight datetime
-        parse to the same value, so the date-only floor/ceil is decided from the INPUT STRING,
-        not the parsed datetime.
-        """
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is not None:
-            return dt.astimezone(UTC)
-        if "T" not in value and " " not in value:
-            dt = (
-                dt.replace(hour=23, minute=59, second=59)
-                if is_end
-                else dt.replace(hour=0, minute=0, second=0)
-            )
-        return dt.replace(tzinfo=UTC)
 
     def _transform_data(self, raw_data: Any, symbol: str) -> pl.DataFrame:
         """Transform Databento data to standard schema."""
@@ -871,11 +848,14 @@ class DataBentoProvider(BaseProvider):
         )
         self._validate_inputs(contract, start, end, schema)
 
-        # Availability gate BEFORE any billed fetch (free metadata). Lexicographic comparison is
-        # chronological for "YYYY-MM-DD" ISO strings. avail is None (unknown, or the lookup failed
-        # — _schema_available_from logs it) intentionally fails OPEN: proceed to the billed fetch.
+        # Availability gate BEFORE any billed fetch (free metadata). Compare PARSED bounds, not
+        # raw strings: a basic (unhyphenated) ISO start like "20250101" would sort AFTER
+        # "2025-02-20" lexicographically and silently bypass the gate. avail is None (unknown, or
+        # the lookup failed — _schema_available_from logs it) intentionally fails OPEN.
         avail = self._schema_available_from(schema, dataset=OPRA_DATASET)
-        if avail and start < avail:
+        if avail and self._parse_iso_bound(start, is_end=False) < self._parse_iso_bound(
+            avail, is_end=False
+        ):
             raise DataNotAvailableError(
                 self.name,
                 f"{schema} is available on OPRA from {avail}; start {start} is too early "
@@ -1024,11 +1004,14 @@ class DataBentoProvider(BaseProvider):
         )
         self._validate_inputs(parent, start, end, schema)
 
-        # Availability gate BEFORE any billed fetch (free metadata). Lexicographic comparison is
-        # chronological for ISO start strings (the date prefix dominates). avail is None
+        # Availability gate BEFORE any billed fetch (free metadata). Compare PARSED bounds, not
+        # raw strings: a basic (unhyphenated) ISO start like "20250101" would sort AFTER
+        # "2025-02-20" lexicographically and silently bypass the gate. avail is None
         # (unknown/lookup failed) fails OPEN: proceed to the billed fetch.
         avail = self._schema_available_from(schema, dataset=OPRA_DATASET)
-        if avail and start < avail:
+        if avail and self._parse_iso_bound(start, is_end=False) < self._parse_iso_bound(
+            avail, is_end=False
+        ):
             raise DataNotAvailableError(
                 self.name,
                 f"{schema} is available on OPRA from {avail}; start {start} is too early "

@@ -296,9 +296,10 @@ class TestDataBentoProvider:
     def test_validate_inputs_intraday_start_date_only_end_same_day(self, provider):
         """An intraday start with a date-only end on the same day validates (matches fetch).
 
-        Regression: _validate_inputs must ceil a date-only end to 23:59:59 like
-        _resolve_request_bound, so it accepts exactly the window _fetch_raw_data builds. Without
-        the aligned ceil, "T19:50" > date-only midnight would spuriously reject a valid window.
+        Regression: _validate_inputs must ceil a date-only end to 23:59:59 via _parse_iso_bound,
+        so it accepts exactly the window _fetch_raw_data builds (which calls the same helper).
+        Without the aligned ceil, "T19:50" > date-only midnight would spuriously reject a valid
+        window.
         """
         # Same-day: intraday start, date-only end -> end ceils to 23:59:59, so 19:50 <= 23:59:59.
         provider._validate_inputs("SPX.OPT", "2025-03-03T19:50", "2025-03-03", "cbbo-1m")
@@ -319,8 +320,8 @@ class TestDataBentoProvider:
     def test_parse_iso_bound_floor_and_ceil_branches(self, provider):
         """Both date-only branches of _parse_iso_bound are locked: start floors, end ceils.
 
-        Mirrors _resolve_request_bound so validation accepts exactly the windows the fetch
-        builds; an explicit time component is honored verbatim on both sides.
+        This is the single floor/ceil helper the fetch path also uses, so validation accepts
+        exactly the windows the fetch builds; an explicit time component is honored verbatim.
         """
         floor = provider._parse_iso_bound("2025-03-03", is_end=False)
         ceil = provider._parse_iso_bound("2025-03-03", is_end=True)

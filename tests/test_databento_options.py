@@ -1369,6 +1369,19 @@ class TestFetchOptionChainQuotes:
             )
         provider.client.timeseries.get_range.assert_not_called()
 
+    def test_availability_gate_handles_unhyphenated_iso_start(self, provider):
+        """Regression: a basic (unhyphenated) ISO start before availability is still gated.
+
+        The gate compares PARSED bounds; a raw-string compare would have let "20250101" through
+        because "20250101" < "2025-02-20" is False lexicographically (the '0' vs '-' at index 4).
+        """
+        provider.client.metadata.get_dataset_range.return_value = {
+            "schema": {"cbbo-1s": {"start": "2025-02-20T00:00:00Z"}}
+        }
+        with pytest.raises(DataNotAvailableError, match="cbbo-1s"):
+            provider.fetch_option_chain_quotes("SPX", "20250101", "20250102", schema="cbbo-1s")
+        provider.client.timeseries.get_range.assert_not_called()
+
     def test_intraday_window_reaches_sdk_unfloored(self, provider):
         """An ISO datetime window flows to the SDK with its HH:MM intact (TASK-001 plumbing)."""
         provider.client.timeseries.get_range.side_effect = [

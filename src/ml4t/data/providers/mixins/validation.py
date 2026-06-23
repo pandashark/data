@@ -87,9 +87,10 @@ class ValidationMixin:
     def _parse_iso_bound(value: str, *, is_end: bool) -> datetime:
         """Parse an ISO-8601 date or datetime into a UTC-aware datetime for comparison.
 
-        Applies the SAME date-only floor/ceil convention as the fetch path
-        (``DataBentoProvider._resolve_request_bound``) so validation accepts exactly the windows
-        the fetch builds: a date-only ``start`` floors to 00:00:00 and a date-only ``end`` ceils
+        This is the SINGLE source of the date-only floor/ceil convention for both validation and
+        the fetch path (``DataBentoProvider._fetch_raw_data`` calls it directly), so validation
+        accepts exactly the windows the fetch builds: a date-only ``start`` floors to 00:00:00 and
+        a date-only ``end`` ceils
         to 23:59:59. Without this, a same-day window with an intraday ``start`` and a date-only
         ``end`` (e.g. ``"...T19:50"`` .. ``"<date>"``) would be wrongly rejected as
         ``start > end`` even though the fetch would build a valid ``19:50 -> 23:59:59`` window.
